@@ -1,0 +1,400 @@
+diff --git a/plugins/platforms/photon/adapter.py b/plugins/platforms/photon/adapter.py
+index 3642d7346b..4f7f8413e6 100644
+--- a/plugins/platforms/photon/adapter.py
++++ b/plugins/platforms/photon/adapter.py
+@@ -893,8 +893,16 @@ class PhotonAdapter(BasePlatformAdapter):
+                 f"reaction:added:{content.get('emoji') or ''}", reply_to_message_id=target_id,
+                 reply_to_text=content.get("targetText") or None, reply_to_is_own_message=True))
+             return
+-        # U+FFFC placeholder: wait for the real attachment. Detected before _record_last_inbound
+-        # so the placeholder isn't the reaction target.
++        # Read receipts are provider control events, not user messages. Photon
++        # Spectrum 12 exposes them through the same stream; dispatching them as
++        # unknown content creates a fake prompt and can feed a read-receipt loop.
++        if ctype in {"read", "read_receipt"}:
++            logger.debug("[photon] ignoring read receipt event")
++            return
++        # U+FFFC placeholder — wait for the real attachment instead of
++        # dispatching. Detected before _record_last_inbound so the placeholder
++        # is not recorded as the reaction target — the real attachment will be.
++
+         if ctype == "text" and (content.get("text") or "").strip() == "\ufffc":
+             self._cancel_pending_fffc(space_id)
+             task = asyncio.create_task(self._fffc_timeout_handler(space_id, message_id or ""))
+diff --git a/plugins/platforms/photon/sidecar/index.mjs b/plugins/platforms/photon/sidecar/index.mjs
+index beb4ad5a5a..1e79eb190e 100644
+--- a/plugins/platforms/photon/sidecar/index.mjs
++++ b/plugins/platforms/photon/sidecar/index.mjs
+@@ -1108,29 +1108,48 @@ const server = http.createServer(async (req, res) => {
+       // spectrum-ts infers name + MIME from the file extension; pass
+       // overrides only when Hermes supplied them so a known-good
+       // inference isn't clobbered with an empty string.
++      let sendPath = path;
+       const opts = {};
+       if (name) opts.name = name;
+       if (mimeType) opts.mimeType = mimeType;
+-      const builder =
+-        kind === "voice"
+-          ? voice(path, Object.keys(opts).length ? opts : undefined)
+-          : attachment(path, Object.keys(opts).length ? opts : undefined);
+-
+-      const result = await space.send(builder);
+-
+-      // iMessage delivers the caption as a separate bubble; send it
+-      // after the media so the attachment renders first.
+-      if (caption && typeof caption === "string") {
+-        try {
+-          await space.send(spectrumText(caption));
+-        } catch (e) {
+-          console.error(
+-            "photon-sidecar: attachment sent but caption failed: " +
+-              (e && e.stack ? e.stack : String(e))
+-          );
++      let cleanup = async () => {};
++      if (kind === "voice") {
++        // Materialize a unique M4A before voice() so converted TTS bytes,
++        // filename, and MIME identity cannot collide with inbound CAF.
++        const { prepareVoiceAttachment } = await import("./voice-send.mjs");
++        const prepared = await prepareVoiceAttachment(path);
++        sendPath = prepared.path;
++        opts.name = prepared.opts.name;
++        opts.mimeType = prepared.opts.mimeType;
++        cleanup = prepared.cleanup;
++      }
++      try {
++        const builder =
++          kind === "voice"
++            ? voice(sendPath, opts)
++            : attachment(
++                sendPath,
++                Object.keys(opts).length ? opts : undefined
++              );
++
++        const result = await space.send(builder);
++
++        // iMessage delivers the caption as a separate bubble; send it
++        // after the media so the attachment renders first.
++        if (caption && typeof caption === "string") {
++          try {
++            await space.send(spectrumText(caption));
++          } catch (e) {
++            console.error(
++              "photon-sidecar: attachment sent but caption failed: " +
++                (e && e.stack ? e.stack : String(e))
++            );
++          }
+         }
++        return ok(res, { messageId: result?.id || null });
++      } finally {
++        await cleanup();
+       }
+-      return ok(res, { messageId: result?.id || null });
+     }
+     if (req.url === "/react") {
+       const { spaceId, messageId, emoji } = body || {};
+diff --git a/plugins/platforms/photon/sidecar/voice-send.mjs b/plugins/platforms/photon/sidecar/voice-send.mjs
+new file mode 100644
+index 0000000000..fea9417a0a
+--- /dev/null
++++ b/plugins/platforms/photon/sidecar/voice-send.mjs
+@@ -0,0 +1,47 @@
++// Materialize Spectrum voice() input as a unique AAC/M4A file.
++// Spectrum 8's uploadVoice() preserved source identity; keep this boundary
++// explicit so the outbound voice attachment is never confused with inbound CAF.
++
++import { randomUUID, createHash } from "node:crypto";
++import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { ensureM4a } from "@spectrum-ts/core/authoring";
++
++const M4A_MIME = "audio/mp4";
++
++function sha256(buffer) {
++  return createHash("sha256").update(buffer).digest("hex");
++}
++
++export async function prepareVoiceAttachment(sourcePath) {
++  if (typeof sourcePath !== "string" || !sourcePath) {
++    throw new Error("prepareVoiceAttachment: source path is required");
++  }
++  const raw = await readFile(sourcePath);
++  const sourceSha = sha256(raw);
++  const converted = await ensureM4a(raw, "");
++  const brand = converted.buffer.toString("ascii", 8, 12);
++  const uploadSha = sha256(converted.buffer);
++  const dir = await mkdtemp(join(tmpdir(), "hermes-photon-voice-"));
++  const fileName = `voice-${randomUUID()}.m4a`;
++  const outPath = join(dir, fileName);
++  await writeFile(outPath, converted.buffer);
++  console.error(
++    "photon-sidecar: voice identity " +
++      `source=${sourcePath} sourceSha=${sourceSha} sourceBytes=${raw.length} ` +
++      `uploadSha=${uploadSha} uploadBytes=${converted.buffer.length} brand=${JSON.stringify(brand)} ` +
++      `fileName=${fileName}`
++  );
++  return {
++    path: outPath,
++    opts: { name: fileName, mimeType: M4A_MIME },
++    sourceSha,
++    uploadSha,
++    uploadBytes: converted.buffer.length,
++    brand,
++    cleanup: async () => {
++      await rm(dir, { recursive: true, force: true }).catch(() => {});
++    },
++  };
++}
+diff --git a/plugins/platforms/photon/sidecar_paths.py b/plugins/platforms/photon/sidecar_paths.py
+index b87f1cd361..f50474101c 100644
+--- a/plugins/platforms/photon/sidecar_paths.py
++++ b/plugins/platforms/photon/sidecar_paths.py
+@@ -20,9 +20,16 @@ from typing import Optional
+ logger = logging.getLogger(__name__)
+ 
+ SOURCE_SIDECAR_DIR = Path(__file__).parent / "sidecar"
+-# Files that define the sidecar; node_modules is deliberately absent (baked on managed
+-# images or installed by npm in the mirror).
+-_MIRROR_FILES = ("index.mjs", "package.json", "package-lock.json", "patch-spectrum-mixed-attachments.mjs")
++# The files that define the sidecar. Mirrored into the writable runtime dir
++# when the install tree is read-only. node_modules is deliberately absent —
++# it is either baked (managed image) or installed by npm in the mirror.
++_MIRROR_FILES = (
++    "index.mjs",
++    "package.json",
++    "package-lock.json",
++    "patch-spectrum-mixed-attachments.mjs",
++    "voice-send.mjs",
++)
+ # Tests monkeypatch these module globals directly; the accessors honor a non-None value.
+ _SIDECAR_DIR: Optional[Path] = None
+ # Written by `hermes photon install-sidecar` on npm failure so check_requirements() can
+diff --git a/tests/plugins/platforms/photon/test_inbound.py b/tests/plugins/platforms/photon/test_inbound.py
+index faf8924e6d..d714dd1caa 100644
+--- a/tests/plugins/platforms/photon/test_inbound.py
++++ b/tests/plugins/platforms/photon/test_inbound.py
+@@ -134,6 +134,21 @@ def _voice_event(
+     }
+ 
+ 
++@pytest.mark.asyncio
++async def test_read_receipt_event_is_ignored(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Provider read receipts never become fake user prompts."""
++    adapter = _make_adapter(monkeypatch)
++    captured = _capture(adapter, monkeypatch)
++
++    event = _dm_event("", msg_id="spc-msg-read")
++    event["content"] = {"type": "read", "messageId": "spc-msg-target"}
++    await adapter._dispatch_inbound(event)
++
++    assert captured == []
++
++
+ @pytest.mark.asyncio
+ async def test_on_inbound_line_dispatches_and_dedups(
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/plugins/platforms/photon/test_sidecar_voice_runtime.py b/tests/plugins/platforms/photon/test_sidecar_voice_runtime.py
+new file mode 100644
+index 0000000000..643c8461e6
+--- /dev/null
++++ b/tests/plugins/platforms/photon/test_sidecar_voice_runtime.py
+@@ -0,0 +1,197 @@
++"""Regression contract for Photon outbound voice identity.
++
++Live failure: Hermes generated a distinct xAI TTS MP3, the gateway extracted
++that MEDIA path, and Spectrum voice() still made iMessage play the inbound CAF
++voice note. Spectrum 8 uploadVoice() transcodes through ensureM4a() but keeps
++the source basename (tts_*.mp3) as the Photon upload filename, so isAudioMessage
++delivery can collapse onto the conversation's original voice-memo slot.
++
++The sidecar must materialize a unique AAC/M4A object whose bytes and filename
++are distinct from the inbound CAF before calling voice().
++"""
++from __future__ import annotations
++
++import hashlib
++import json
++import shutil
++import subprocess
++import wave
++from pathlib import Path
++
++import pytest
++
++from gateway.platforms.base import BasePlatformAdapter
++
++
++def _sidecar_dir() -> Path:
++    return Path(__file__).parents[4] / "plugins" / "platforms" / "photon" / "sidecar"
++
++
++def _ffmpeg() -> Path:
++    return _sidecar_dir() / "node_modules" / "ffmpeg-static" / "ffmpeg"
++
++
++def _write_wav(path: Path, *, seconds: float, sample: bytes = b"\x00\x00") -> None:
++    frames = int(24_000 * seconds)
++    with wave.open(str(path), "wb") as handle:
++        handle.setnchannels(1)
++        handle.setsampwidth(2)
++        handle.setframerate(24_000)
++        handle.writeframes(sample * frames)
++
++
++def test_sidecar_declares_ffmpeg_static_for_voice_transcoding() -> None:
++    sidecar = _sidecar_dir()
++    package = json.loads((sidecar / "package.json").read_text(encoding="utf-8"))
++    lock = json.loads((sidecar / "package-lock.json").read_text(encoding="utf-8"))
++
++    assert "ffmpeg-static" in package["dependencies"], (
++        "Photon voice() transcodes MP3/WAV input via ffmpeg; the sidecar must "
++        "ship ffmpeg-static instead of assuming a host binary."
++    )
++    assert lock["packages"][""]["dependencies"]["ffmpeg-static"] == package[
++        "dependencies"
++    ]["ffmpeg-static"]
++    assert "node_modules/ffmpeg-static" in lock["packages"]
++
++
++def test_extract_media_keeps_tts_path_not_sibling_inbound_caf(tmp_path: Path) -> None:
++    """The live 121-char reply tagged the TTS file; inbound CAF must not ride along."""
++    inbound = tmp_path / "audio_01f0c3748bc6.caf"
++    tts = tmp_path / "tts_20260821_021929_492327.mp3"
++    inbound.write_bytes(b"caffinbound")
++    tts.write_bytes(b"id3tts-bytes")
++    media, text = BasePlatformAdapter.extract_media(
++        f"Here she is, Tom.\n\nMEDIA:{tts}"
++    )
++    assert [path for path, _is_voice in media] == [str(tts)]
++    assert str(inbound) not in text
++    assert all(str(inbound) != path for path, _is_voice in media)
++
++
++@pytest.mark.skipif(
++    shutil.which("node") is None or not _ffmpeg().is_file(),
++    reason="Photon sidecar npm dependencies are not installed",
++)
++def test_spectrum_voice_conversion_uses_bundled_ffmpeg(tmp_path: Path) -> None:
++    """A non-M4A voice input must convert through the shipped static binary."""
++    source = tmp_path / "voice.wav"
++    _write_wav(source, seconds=0.25)
++
++    script = f"""
++import {{ readFile }} from 'node:fs/promises';
++import {{ ensureM4a }} from '@spectrum-ts/core/authoring';
++const source = await readFile({json.dumps(str(source))});
++const result = await ensureM4a(source, 'audio/wav');
++const brand = result.buffer.toString('ascii', 8, 12);
++console.log(JSON.stringify({{ brand, bytes: result.buffer.length }}));
++if (!['M4A ', 'M4B ', 'M4P ', 'mp42', 'mp41', 'isom', 'iso2'].includes(brand)) process.exit(1);
++"""
++    run = subprocess.run(
++        ["node", "--input-type=module", "-e", script],
++        cwd=_sidecar_dir(),
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert run.returncode == 0, run.stderr
++    assert json.loads(run.stdout)["brand"] in {
++        "M4A ",
++        "M4B ",
++        "M4P ",
++        "mp42",
++        "mp41",
++        "isom",
++        "iso2",
++    }
++
++
++@pytest.mark.skipif(
++    shutil.which("node") is None or not _ffmpeg().is_file(),
++    reason="Photon sidecar npm dependencies are not installed",
++)
++def test_prepare_voice_attachment_does_not_reuse_inbound_caf_identity(
++    tmp_path: Path,
++) -> None:
++    """TTS upload bytes and filename must be distinct from the inbound CAF.
++
++    This is the live loopback: inbound CAF (7.56s) vs xAI TTS MP3 (16.6s).
++    Spectrum voice() used to upload the transcoded TTS under tts_*.mp3, and
++    iMessage played the original voice memo. The sidecar must emit a unique
++    M4A whose hash is not the inbound file's hash.
++    """
++    inbound_wav = tmp_path / "inbound.wav"
++    tts_wav = tmp_path / "tts.wav"
++    inbound_caf = tmp_path / "inbound.caf"
++    _write_wav(inbound_wav, seconds=0.4, sample=b"\x11\x00")
++    _write_wav(tts_wav, seconds=0.9, sample=b"\x7f\xff")
++    transcode = subprocess.run(
++        [
++            str(_ffmpeg()),
++            "-y",
++            "-i",
++            str(inbound_wav),
++            "-f",
++            "caf",
++            str(inbound_caf),
++        ],
++        cwd=_sidecar_dir(),
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert transcode.returncode == 0, transcode.stderr
++    inbound_sha = hashlib.sha256(inbound_caf.read_bytes()).hexdigest()
++
++    module = (_sidecar_dir() / "voice-send.mjs").resolve()
++    script = f"""
++import {{ prepareVoiceAttachment }} from {json.dumps(module.as_uri())};
++const caf = await prepareVoiceAttachment({json.dumps(str(inbound_caf))});
++const tts = await prepareVoiceAttachment({json.dumps(str(tts_wav))});
++try {{
++  console.log(JSON.stringify({{
++    caf: {{
++      name: caf.opts.name,
++      mimeType: caf.opts.mimeType,
++      uploadSha: caf.uploadSha,
++      brand: caf.brand,
++      sourceSha: caf.sourceSha,
++    }},
++    tts: {{
++      name: tts.opts.name,
++      mimeType: tts.opts.mimeType,
++      uploadSha: tts.uploadSha,
++      brand: tts.brand,
++      sourceSha: tts.sourceSha,
++    }},
++  }}));
++}} finally {{
++  await caf.cleanup();
++  await tts.cleanup();
++}}
++"""
++    run = subprocess.run(
++        ["node", "--input-type=module", "-e", script],
++        cwd=_sidecar_dir(),
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert run.returncode == 0, run.stderr
++    payload = json.loads(run.stdout)
++    caf = payload["caf"]
++    tts = payload["tts"]
++
++    assert caf["mimeType"] == "audio/mp4"
++    assert tts["mimeType"] == "audio/mp4"
++    assert caf["name"].endswith(".m4a")
++    assert tts["name"].endswith(".m4a")
++    assert caf["name"] != tts["name"]
++    assert not caf["name"].endswith(".caf")
++    assert not tts["name"].endswith(".mp3")
++    assert caf["brand"] in {"M4A ", "M4B ", "M4P ", "mp42", "mp41", "isom", "iso2"}
++    assert tts["brand"] in {"M4A ", "M4B ", "M4P ", "mp42", "mp41", "isom", "iso2"}
++    assert caf["sourceSha"] == inbound_sha
++    assert tts["uploadSha"] != inbound_sha
++    assert tts["uploadSha"] != caf["uploadSha"]
++    assert tts["uploadSha"] != tts["sourceSha"]
